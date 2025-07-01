@@ -44,6 +44,11 @@ from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
 
+# TODO: re-install diffusers after re-condition unet
+'''
+cd diffusers
+pip install -e .
+'''
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionXLPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
@@ -53,6 +58,9 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_torch_npu_available, is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+################################################## add package ##################################################
+import ipdb
+################################################## add package ##################################################
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.34.0.dev0")
@@ -63,10 +71,13 @@ if is_torch_npu_available():
 
     torch.npu.config.allow_internal_format = False
 
+
+
+
 DATASET_NAME_MAPPING = {
     "lambdalabs/naruto-blip-captions": ("image", "text"),
+    "/mmu_mllm_hdd_2/yangzhuoran/dataset/laion-conceptual-captions-12m-webdataset/parquet/00000_top5000": ("image", "text", "image_embeds"),
 }
-
 
 def save_model_card(
     repo_id: str,
@@ -138,14 +149,16 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        # default=None, 
+        default='/mmu_mllm_hdd_2/yangzhuoran/model/stable-diffusion-xl-base-1.0',
+        # required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
-        "--pretrained_vae_model_name_or_path",
+        "--pretrained_vae_model_name_or_path", 
         type=str,
-        default=None,
+        # default=None, 
+        default='/mmu_mllm_hdd_2/yangzhuoran/model/sdxl-vae-fp16-fix',
         help="Path to pretrained VAE model with better numerical stability. More details: https://github.com/huggingface/diffusers/pull/4038.",
     )
     parser.add_argument(
@@ -164,7 +177,9 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default=None,
+        # default=None, 
+        # default='/mmu_mllm_hdd_2/yangzhuoran/dataset/naruto-blip-captions',
+        default='/mmu_mllm_hdd_2/yangzhuoran/dataset/laion-conceptual-captions-12m-webdataset/parquet/00000_top5000',
         help=(
             "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
@@ -196,6 +211,13 @@ def parse_args(input_args=None):
         default="text",
         help="The column of the dataset containing a caption or a list of captions.",
     )
+    #################################### ADD: embedding_column ####################################
+    parser.add_argument(
+        "--embedding_column", type=str, default="image_embeds", help="The column of the dataset containing the image EVA-CLIP embedding."
+    )
+    #################################### ADD: embedding_column ####################################
+
+
     parser.add_argument(
         "--validation_prompt",
         type=str,
@@ -269,7 +291,7 @@ def parse_args(input_args=None):
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=8, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -485,6 +507,7 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
+    
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -553,6 +576,7 @@ def compute_vae_encodings(batch, vae):
 
     # There might have slightly performance improvement
     # by changing model_input.cpu() to accelerator.gather(model_input)
+    torch.cuda.empty_cache() 
     return {"model_input": model_input.cpu()}
 
 
@@ -596,6 +620,16 @@ def generate_timestep_weights(args, num_timesteps):
 
     return weights
 
+
+# resize original image -> re-constructed image size
+from PIL import Image
+import torchvision.transforms as T
+def load_and_resize(image_path, target_size):
+    image = Image.open(image_path).convert("RGB")
+    # print("image_origianl: ", np.array(image).shape)
+    resize_transform = T.Resize(target_size, interpolation=T.InterpolationMode.BILINEAR)
+    return resize_transform(image)
+    
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -702,10 +736,56 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
     )
+
+    # TODO: change unet model architechture
+    '''
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
     )
+    '''
 
+    
+    # 1. load config
+    unet_config = UNet2DConditionModel.load_config(
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    )
+
+    # 2. revise config 
+    unet_config["encoder_hid_dim"] = 64  
+    unet_config["encoder_hid_dim_type"] = 'image_proj'
+    unet_config["addition_embed_type"] = 'image'
+
+    # 3. init UNet 
+    unet = UNet2DConditionModel.from_config(unet_config)
+
+    # 4. load pretrained weights safely
+    pretrained_unet = UNet2DConditionModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=args.revision,
+        variant=args.variant,
+    )
+
+    # 4.1 拿到原始 checkpoint 的参数字典
+    state_dict = pretrained_unet.state_dict()
+
+    # 4.2 删除维度冲突的层，例如 add_embedding.image_proj
+    keys_to_remove = [k for k in state_dict if k.startswith("add_embedding.image_proj.")]
+    for k in keys_to_remove:
+        print(f"⚠️ Removing incompatible key from pretrained weights: {k}")
+        del state_dict[k]
+
+    # 4.3 加载剩余参数
+    missing, unexpected = unet.load_state_dict(state_dict, strict=False)
+    logger.info(f"✅ UNet loaded with modified config. Missing keys: {missing}, Unexpected keys: {unexpected}")
+
+    torch.nn.init.xavier_uniform_(unet.add_embedding.image_proj.weight)
+    torch.nn.init.zeros_(unet.add_embedding.image_proj.bias)
+
+
+    
+
+    # TODO: Freeze vae and text encoders.
     # Freeze vae and text encoders.
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
@@ -729,10 +809,17 @@ def main(args):
 
     # Create EMA for the unet.
     if args.use_ema:
+        # TODO: load ema_unet using revised config
+        '''
         ema_unet = UNet2DConditionModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
         )
         ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
+        '''
+        ema_unet_model = UNet2DConditionModel.from_config(unet_config)
+        ema_unet_model.load_state_dict(unet.state_dict())  
+        ema_unet = EMAModel(ema_unet_model.parameters(), model_cls=UNet2DConditionModel, model_config=unet_config)
+        
     if args.enable_npu_flash_attention:
         if is_torch_npu_available():
             logger.info("npu flash attention enabled.")
@@ -758,10 +845,14 @@ def main(args):
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
-                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                    # TODO: save unet using revised config: unet_config
+                    # ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"), config=unet_config)
 
                 for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
+                    # TODO: save unet using revised config: unet_config
+                    # model.save_pretrained(os.path.join(output_dir, "unet"))
+                    model.save_pretrained(os.path.join(output_dir, "unet"), config=unet_config)
 
                     # make sure to pop weight so that corresponding model is not saved again
                     if weights:
@@ -829,11 +920,15 @@ def main(args):
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
+    
     if args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
+        
+
         dataset = load_dataset(
             args.dataset_name, args.dataset_config_name, cache_dir=args.cache_dir, data_dir=args.train_data_dir
         )
+        
     else:
         data_files = {}
         if args.train_data_dir is not None:
@@ -845,13 +940,19 @@ def main(args):
         )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
+    
+    
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
+    # print("dataset: ", dataset)
     column_names = dataset["train"].column_names
 
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
+    
+    # print("dataset[train].column_names:", column_names)
+    # print("dataset_columns:", dataset_columns)
+    # print("args.image_column:", args.image_column)
     if args.image_column is None:
         image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
     else:
@@ -868,6 +969,18 @@ def main(args):
             raise ValueError(
                 f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
             )
+    
+
+    ########################### ADD: args.embedding_column ###########################
+    if args.embedding_column is None:
+        embedding_column = dataset_columns[2] if dataset_columns is not None else column_names[2]
+    else:
+        embedding_column = args.embedding_column
+        if embedding_column not in column_names:
+            raise ValueError(
+                f"--embedding_column' value '{args.embedding_column}' needs to be one of: {', '.join(column_names)}"
+            )
+    ########################### ADD: args.embedding_column ###########################
 
     # Preprocessing the datasets.
     interpolation = getattr(transforms.InterpolationMode, args.image_interpolation_mode.upper(), None)
@@ -878,6 +991,7 @@ def main(args):
     train_flip = transforms.RandomHorizontalFlip(p=1.0)
     train_transforms = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
+    
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         # image aug
@@ -930,43 +1044,65 @@ def main(args):
 
         # fingerprint used by the cache for the other processes to load the result
         # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
-        new_fingerprint = Hasher.hash(args)
+        
+        # map memory efficiency
+        # new_fingerprint = Hasher.hash(args)
+        new_fingerprint = Hasher.hash({
+            "args": args
+        })
         new_fingerprint_for_vae = Hasher.hash((vae_path, args))
         train_dataset_with_embeddings = train_dataset.map(
             compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint
         )
+        
         train_dataset_with_vae = train_dataset.map(
             compute_vae_encodings_fn,
             batched=True,
-            batch_size=args.train_batch_size,
+            batch_size=args.train_batch_size, # 
             new_fingerprint=new_fingerprint_for_vae,
         )
         precomputed_dataset = concatenate_datasets(
-            [train_dataset_with_embeddings, train_dataset_with_vae.remove_columns(["image", "text"])], axis=1
+            [train_dataset_with_embeddings, train_dataset_with_vae.remove_columns(["image", "text", "image_embeds"])], axis=1
         )
         precomputed_dataset = precomputed_dataset.with_transform(preprocess_train)
-
-    del compute_vae_encodings_fn, compute_embeddings_fn, text_encoder_one, text_encoder_two
-    del text_encoders, tokenizers, vae
+        # print("precomputed_dataset: ", precomputed_dataset) # .column_names
+        '''
+        precomputed_dataset:  Dataset({
+            features: ['image', 'text', 'image_embeds', 'prompt_embeds', 'pooled_prompt_embeds', 'model_input'],
+            num_rows: 5000
+        })
+        '''
+    # TODO: del 
+    # del compute_vae_encodings_fn, compute_embeddings_fn, text_encoder_one, text_encoder_two
+    # del text_encoders, tokenizers, vae
     gc.collect()
     if is_torch_npu_available():
         torch_npu.npu.empty_cache()
     elif torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+
+    # TODO: to tensor(image_embeds), add to train_dataloader
     def collate_fn(examples):
+        # examples[0]["model_input"]: list
         model_input = torch.stack([torch.tensor(example["model_input"]) for example in examples])
         original_sizes = [example["original_sizes"] for example in examples]
         crop_top_lefts = [example["crop_top_lefts"] for example in examples]
         prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
         pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
-
+        image_embeds = torch.stack([torch.tensor(example["image_embeds"]) for example in examples])
+        # print("model_input: ", model_input.shape) # image vae embedding: torch.Size([1, 4, 64, 64])
+        # print("prompt_embeds: ", prompt_embeds.shape) # torch.Size([1, 77, 2048])
+        # print("image_embeds: ", image_embeds.shape) # torch.Size([1, 64])
+        # print("pooled_prompt_embeds: ", pooled_prompt_embeds.shape) # torch.Size([1, 77, 2048])
+        
         return {
             "model_input": model_input,
             "prompt_embeds": prompt_embeds,
             "pooled_prompt_embeds": pooled_prompt_embeds,
             "original_sizes": original_sizes,
             "crop_top_lefts": crop_top_lefts,
+            'image_embeds': image_embeds,
         }
 
     # DataLoaders creation:
@@ -1071,7 +1207,7 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
+    # TODO: freeze text encoder, vae, fintune unet, change condition: prompt_embeds -> image_embeds
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
@@ -1120,6 +1256,14 @@ def main(args):
                 prompt_embeds = batch["prompt_embeds"].to(accelerator.device, dtype=weight_dtype)
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device)
                 unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
+
+                image_embeds = batch["image_embeds"].to(accelerator.device) # , dtype=weight_dtype)
+                unet_added_conditions.update({"image_embeds": image_embeds})
+                # print("weight_dtype: ", weight_dtype)
+                # print("image_embeds:", image_embeds.shape) # [1,64]
+                
+
+                # TODO: change condition: prompt_embeds -> image_embeds
                 model_pred = unet(
                     noisy_model_input,
                     timesteps,
@@ -1218,149 +1362,318 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
+        
 
-        if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                logger.info(
-                    f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-                    f" {args.validation_prompt}."
-                )
-                if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                    ema_unet.store(unet.parameters())
-                    ema_unet.copy_to(unet.parameters())
+        
+        # TODO: unet inference input condition
+        
+        # if accelerator.is_main_process:
+        if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+            logger.info(
+                f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+                f" {args.validation_prompt}."
+            )
+            if args.use_ema:
+                # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                ema_unet.store(unet.parameters())
+                ema_unet.copy_to(unet.parameters())
 
-                # create pipeline
-                vae = AutoencoderKL.from_pretrained(
-                    vae_path,
-                    subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
-                    revision=args.revision,
-                    variant=args.variant,
-                )
-                pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    vae=vae,
-                    unet=accelerator.unwrap_model(unet),
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=weight_dtype,
-                )
-                if args.prediction_type is not None:
-                    scheduler_args = {"prediction_type": args.prediction_type}
-                    pipeline.scheduler = pipeline.scheduler.from_config(pipeline.scheduler.config, **scheduler_args)
+            # create pipeline
+            vae = AutoencoderKL.from_pretrained(
+                vae_path,
+                subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+                revision=args.revision,
+                variant=args.variant,
+            )
+            # TODO: revise new pipeline
+            # pipeline = StableDiffusionXLPipeline.from_pretrained(
+            #     args.pretrained_model_name_or_path,
+            #     vae=vae,
+            #     unet=accelerator.unwrap_model(unet),
+            #     revision=args.revision,
+            #     variant=args.variant,
+            #     torch_dtype=weight_dtype,
+            # )
+            pipeline = StableDiffusionXLPipeline(
+                vae=vae,
+                text_encoder=text_encoder_one,
+                text_encoder_2=text_encoder_two,
+                tokenizer=tokenizer_one,
+                tokenizer_2=tokenizer_two,
+                unet=accelerator.unwrap_model(unet),  # <-- use your customized unet
+                scheduler=noise_scheduler,
+            )
+            
 
-                pipeline = pipeline.to(accelerator.device)
-                pipeline.set_progress_bar_config(disable=True)
+            if args.prediction_type is not None:
+                scheduler_args = {"prediction_type": args.prediction_type}
+                pipeline.scheduler = pipeline.scheduler.from_config(pipeline.scheduler.config, **scheduler_args)
 
-                # run inference
-                generator = (
-                    torch.Generator(device=accelerator.device).manual_seed(args.seed)
-                    if args.seed is not None
-                    else None
-                )
-                pipeline_args = {"prompt": args.validation_prompt}
-
-                with autocast_ctx:
-                    images = [
-                        pipeline(**pipeline_args, generator=generator, num_inference_steps=25).images[0]
-                        for _ in range(args.num_validation_images)
-                    ]
-
-                for tracker in accelerator.trackers:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "validation": [
-                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
-
-                del pipeline
-                if is_torch_npu_available():
-                    torch_npu.npu.empty_cache()
-                elif torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                if args.use_ema:
-                    # Switch back to the original UNet parameters.
-                    ema_unet.restore(unet.parameters())
-
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        unet = unwrap_model(unet)
-        if args.use_ema:
-            ema_unet.copy_to(unet.parameters())
-
-        # Serialize pipeline.
-        vae = AutoencoderKL.from_pretrained(
-            vae_path,
-            subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
-            revision=args.revision,
-            variant=args.variant,
-            torch_dtype=weight_dtype,
-        )
-        pipeline = StableDiffusionXLPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            unet=unet,
-            vae=vae,
-            revision=args.revision,
-            variant=args.variant,
-            torch_dtype=weight_dtype,
-        )
-        if args.prediction_type is not None:
-            scheduler_args = {"prediction_type": args.prediction_type}
-            pipeline.scheduler = pipeline.scheduler.from_config(pipeline.scheduler.config, **scheduler_args)
-        pipeline.save_pretrained(args.output_dir)
-
-        # run inference
-        images = []
-        if args.validation_prompt and args.num_validation_images > 0:
             pipeline = pipeline.to(accelerator.device)
+            pipeline.set_progress_bar_config(disable=True)
+
+            # run inference
             generator = (
-                torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed is not None else None
+                torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                if args.seed is not None
+                else None
             )
 
+            # TODO: revise inference 
+            '''
+            pipeline_args = {"prompt": args.validation_prompt}
             with autocast_ctx:
                 images = [
-                    pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
+                    pipeline(**pipeline_args, generator=generator, num_inference_steps=25).images[0]
                     for _ in range(args.num_validation_images)
                 ]
+            '''
+            with autocast_ctx:
+                images = []
+                for _ in range(args.num_validation_images):
+                    # 构造 image condition
+                    # TODO: construct val_dataloader
+                    real_iamge_path = '/mmu_mllm_hdd_2/yangzhuoran/dataset/laion-conceptual-captions-12m-webdataset/data/00000/00000001.jpg'
+                    # prompt = 'Use these great kitchen activities to teach your toddler the letter k.'
+                    
+                    npy_path = '/mmu_mllm_hdd_2/yangzhuoran/dataset/laion-conceptual-captions-12m-webdataset/embedding/image_embedding/00000/00000001.npy'
+                    image_embeds = torch.tensor(np.load(npy_path).squeeze().astype(np.float32).tolist()).unsqueeze(0).to(accelerator.device)       
+                    # print("image_embeds: ", image_embeds.shape)
+                    # batch = next(iter(train_dataloader))
+                    # image_embeds = batch["image_embeds"].to(accelerator.device)           # (B, D)
+                    image_embeds = image_embeds.unsqueeze(1)                              # (B, 1, D)    
+                    negative_image_embeds = torch.zeros_like(image_embeds)                # (B, 1, D)
+                    image_embeds_with_neg = torch.cat([negative_image_embeds, image_embeds], dim=0)  # (2B, 1, D)
+                    image_embeds = [image_embeds_with_neg]  # Tensor(2B, 1, D)
+                    # ip_adapter_image_embeds (`List[torch.Tensor]`, *optional*):
+                    # Pre-generated image embeddings for IP-Adapter. It should be a list of length same as number of
+                    # IP-adapters. Each element should be a tensor of shape `(batch_size, num_images, emb_dim)`. It should
+                    # contain the negative image embedding if `do_classifier_free_guidance` is set to `True`. If not
+                    # provided, embeddings are computed from the `ip_adapter_image` input argument.
+                    
+                    image = pipeline(
+                        prompt=args.validation_prompt,
+                        ip_adapter_image_embeds=image_embeds, 
+                        generator=generator,
+                        num_inference_steps=25,
+                    ).images[0]
+                    images.append(image)
+            # TODO: revise inference 
+            
+            generated_size = (1024, 1024)  
+            originals = [load_and_resize(real_iamge_path, generated_size) for _ in range(len(images))]
+            if accelerator.is_main_process:
+                for tracker in accelerator.trackers:
 
-            for tracker in accelerator.trackers:
-                if tracker.name == "tensorboard":
-                    np_images = np.stack([np.asarray(img) for img in images])
-                    tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
-                if tracker.name == "wandb":
-                    tracker.log(
-                        {
-                            "test": [
-                                wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                for i, image in enumerate(images)
+                    np_originals = np.stack([np.array(img) for img in originals])  # (N, 1024, 1024, 3)
+                    np_reconsts = np.stack([np.array(img) for img in images])    # (N, 1024, 1024, 3)
+                    # print("np_originals: ", np_originals.shape)
+                    # print("np_reconsts: ", np_reconsts.shape)
+                    if tracker.name == "tensorboard":
+                        # np_images = np.stack([np.asarray(img) for img in images])
+                        # tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
+
+                        grid = np.concatenate([np_originals, np_reconsts], axis=2)
+                        tracker.writer.add_images(
+                            "validation/original_vs_recon", 
+                            grid, 
+                            epoch, 
+                            dataformats="NHWC"
+                        )
+                    if tracker.name == "wandb":
+                        # TODO: visualize Original & Reconstruction
+
+                        
+                        # tracker.log(
+                        #     {
+                        #         "validation": [
+                        #             wandb.Image(image, caption=f"{i}: {prompt}")
+                        #             for i, image in enumerate(images)
+                        #         ]
+                        #     }
+                        # )
+                        
+                        tracker.log({
+                            "validation": [
+                                wandb.Image(
+                                    # 水平拼接并确保为uint8格式
+                                    np.concatenate([
+                                        np.array(original), 
+                                        np.array(recon)
+                                    ], axis=1).astype('uint8'),
+                                    caption=f"Sample {i}: Original (left) vs Generated (right)"
+                                )
+                                for i, (original, recon) in enumerate(zip(originals, images))
                             ]
-                        }
-                    )
+                        })
+                        
 
+            del pipeline
+            if is_torch_npu_available():
+                torch_npu.npu.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            if args.use_ema:
+                # Switch back to the original UNet parameters.
+                ema_unet.restore(unet.parameters())
+        
+
+    accelerator.wait_for_everyone()
+    
+    # if accelerator.is_main_process:
+    unet = unwrap_model(unet)
+    if args.use_ema:
+        ema_unet.copy_to(unet.parameters())
+
+    # Serialize pipeline.
+    vae = AutoencoderKL.from_pretrained(
+        vae_path,
+        subfolder="vae" if args.pretrained_vae_model_name_or_path is None else None,
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    # TODO: revise inference pipeline
+    # pipeline = StableDiffusionXLPipeline.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     unet=unet,
+    #     vae=vae,
+    #     revision=args.revision,
+    #     variant=args.variant,
+    #     torch_dtype=weight_dtype,
+    # )
+    pipeline = StableDiffusionXLPipeline(
+            vae=vae,
+            text_encoder=text_encoder_one,
+            text_encoder_2=text_encoder_two,
+            tokenizer=tokenizer_one,
+            tokenizer_2=tokenizer_two,
+            unet=unet, 
+            scheduler=noise_scheduler,
+        )
+
+
+    if args.prediction_type is not None:
+        scheduler_args = {"prediction_type": args.prediction_type}
+        pipeline.scheduler = pipeline.scheduler.from_config(pipeline.scheduler.config, **scheduler_args)
+    pipeline.save_pretrained(args.output_dir)
+
+    # run inference
+    images = []
+    if args.validation_prompt and args.num_validation_images > 0:
+        pipeline = pipeline.to(accelerator.device)
+        generator = (
+            torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed is not None else None
+        )
+        # TODO: revise inference
+        # with autocast_ctx:
+        #     images = [
+        #         pipeline(args.validation_prompt, num_inference_steps=25, generator=generator).images[0]
+        #         for _ in range(args.num_validation_images)
+        #     ]
+        with autocast_ctx:
+            for _ in range(args.num_validation_images):
+                # image condition
+                real_iamge_path = '/mmu_mllm_hdd_2/yangzhuoran/dataset/laion-conceptual-captions-12m-webdataset/data/00000/00000049.jpg'
+                prompt = 'Girls in conversation after the Transform symposium in Melbourne, 2013.'
+                npy_path = '/mmu_mllm_hdd_2/yangzhuoran/dataset/laion-conceptual-captions-12m-webdataset/embedding/image_embedding/00000/00000049.npy'
+                image_embeds = torch.tensor(np.load(npy_path).squeeze().astype(np.float32).tolist()).unsqueeze(0).to(accelerator.device)       
+                
+                # batch = next(iter(train_dataloader))
+                # image_embeds = batch["image_embeds"].to(accelerator.device)           # (B, D)
+                image_embeds = image_embeds.unsqueeze(1)                              # (B, 1, D)                                     
+                negative_image_embeds = torch.zeros_like(image_embeds)                # (B, 1, D)
+                image_embeds_with_neg = torch.cat([negative_image_embeds, image_embeds], dim=0)  # (2B, 1, D)
+                image_embeds = [image_embeds_with_neg]  # Tensor(2B, 1, D)
+
+                
+                # ip_adapter_image_embeds (`List[torch.Tensor]`, *optional*):
+                # Pre-generated image embeddings for IP-Adapter. It should be a list of length same as number of
+                # IP-adapters. Each element should be a tensor of shape `(batch_size, num_images, emb_dim)`. It should
+                # contain the negative image embedding if `do_classifier_free_guidance` is set to `True`. If not
+                # provided, embeddings are computed from the `ip_adapter_image` input argument.
+                
+                image = pipeline(
+                    prompt=args.validation_prompt,
+                    ip_adapter_image_embeds=image_embeds, 
+                    generator=generator,
+                    num_inference_steps=25,
+                ).images[0]
+                images.append(image)
+
+        generated_size = (1024, 1024)   
+        originals = [load_and_resize(real_iamge_path, generated_size) for _ in range(len(images))]
+
+        if accelerator.is_main_process:
+            for tracker in accelerator.trackers:
+                np_originals = np.stack([np.array(img) for img in originals])  # (N, 1024, 1024, 3)
+                np_reconsts = np.stack([np.array(img) for img in images])    # (N, 1024, 1024, 3)
+                if tracker.name == "tensorboard":
+                    # np_images = np.stack([np.asarray(img) for img in images])
+                    # tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
+                    grid = np.concatenate([np_originals, np_reconsts], axis=2)
+                    tracker.writer.add_images(
+                        "test/original_vs_recon", 
+                        grid, 
+                        epoch, 
+                        dataformats="NHWC"
+                    )
+                    
+                    
+                if tracker.name == "wandb":
+                    
+                        
+                    # tracker.log(
+                    #     {
+                    #         "test": [
+                    #             wandb.Image(image, caption=f"{i}: {prompt}")
+                    #             for i, image in enumerate(images)
+                    #         ]
+                    #     }
+                    # )
+
+                    tracker.log({
+                        "test": [
+                            wandb.Image(
+                                # 水平拼接并确保为uint8格式
+                                np.concatenate([
+                                    np.array(original), 
+                                    np.array(recon)
+                                ], axis=1).astype('uint8'),
+                                caption=f"Sample {i}: Original (left) vs Generated (right)"
+                            )
+                            for i, (original, recon) in enumerate(zip(originals, images))
+                        ]
+                    })
+                        
+                    
+
+
+
+    if accelerator.is_main_process:
         if args.push_to_hub:
             save_model_card(
                 repo_id=repo_id,
                 images=images,
                 validation_prompt=args.validation_prompt,
-                base_model=args.pretrained_model_name_or_path,
-                dataset_name=args.dataset_name,
+                #base_model=args.pretrained_model_name_or_path,
+                base_model='stabilityai/stable-diffusion-xl-base-1.0',
+                #dataset_name=args.dataset_name,
+                dataset_name='madebyollin/sdxl-vae-fp16-fix',
                 repo_folder=args.output_dir,
                 vae_path=args.pretrained_vae_model_name_or_path,
             )
+
+            
             upload_folder(
                 repo_id=repo_id,
                 folder_path=args.output_dir,
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
+
+                
 
     accelerator.end_training()
 

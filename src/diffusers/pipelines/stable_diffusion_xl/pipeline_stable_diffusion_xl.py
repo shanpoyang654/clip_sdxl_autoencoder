@@ -250,7 +250,7 @@ class StableDiffusionXLPipeline(
         tokenizer_2: CLIPTokenizer,
         unet: UNet2DConditionModel,
         scheduler: KarrasDiffusionSchedulers,
-        image_encoder: CLIPVisionModelWithProjection = None,
+        image_encoder: CLIPVisionModelWithProjection = None, # TODO:
         feature_extractor: CLIPImageProcessor = None,
         force_zeros_for_empty_prompt: bool = True,
         add_watermarker: Optional[bool] = None,
@@ -739,7 +739,10 @@ class StableDiffusionXLPipeline(
         passed_add_embed_dim = (
             self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
         )
+
+        
         expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
+        
 
         if expected_add_embed_dim != passed_add_embed_dim:
             raise ValueError(
@@ -1136,32 +1139,32 @@ class StableDiffusionXLPipeline(
         else:
             text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
 
-        add_time_ids = self._get_add_time_ids(
-            original_size,
-            crops_coords_top_left,
-            target_size,
-            dtype=prompt_embeds.dtype,
-            text_encoder_projection_dim=text_encoder_projection_dim,
-        )
-        if negative_original_size is not None and negative_target_size is not None:
-            negative_add_time_ids = self._get_add_time_ids(
-                negative_original_size,
-                negative_crops_coords_top_left,
-                negative_target_size,
-                dtype=prompt_embeds.dtype,
-                text_encoder_projection_dim=text_encoder_projection_dim,
-            )
-        else:
-            negative_add_time_ids = add_time_ids
+        # add_time_ids = self._get_add_time_ids(
+        #     original_size,
+        #     crops_coords_top_left,
+        #     target_size,
+        #     dtype=prompt_embeds.dtype,
+        #     text_encoder_projection_dim=text_encoder_projection_dim,
+        # )
+        # if negative_original_size is not None and negative_target_size is not None:
+        #     negative_add_time_ids = self._get_add_time_ids(
+        #         negative_original_size,
+        #         negative_crops_coords_top_left,
+        #         negative_target_size,
+        #         dtype=prompt_embeds.dtype,
+        #         text_encoder_projection_dim=text_encoder_projection_dim,
+        #     )
+        # else:
+        #     negative_add_time_ids = add_time_ids
 
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
-            add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
+            # add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
 
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
-        add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+        # add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
 
         if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
@@ -1211,16 +1214,18 @@ class StableDiffusionXLPipeline(
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 # predict the noise residual
-                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                # added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                added_cond_kwargs = {"text_embeds": add_text_embeds}
+                
                 if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
-                    added_cond_kwargs["image_embeds"] = image_embeds
+                    added_cond_kwargs["image_embeds"] = image_embeds[0].squeeze(1)
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
                     encoder_hidden_states=prompt_embeds,
                     timestep_cond=timestep_cond,
                     cross_attention_kwargs=self.cross_attention_kwargs,
-                    added_cond_kwargs=added_cond_kwargs,
+                    added_cond_kwargs=added_cond_kwargs, # TODO: add image_embeds
                     return_dict=False,
                 )[0]
 
@@ -1250,7 +1255,7 @@ class StableDiffusionXLPipeline(
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     add_text_embeds = callback_outputs.pop("add_text_embeds", add_text_embeds)
-                    add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
+                    # add_time_ids = callback_outputs.pop("add_time_ids", add_time_ids)
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

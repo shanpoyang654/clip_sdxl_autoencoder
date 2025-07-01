@@ -68,6 +68,7 @@ class UNet2DConditionOutput(BaseOutput):
     sample: torch.Tensor = None
 
 
+# TODO: re-condition unet: prompt_embs -> embedding(image clip embedding)
 class UNet2DConditionModel(
     ModelMixin, ConfigMixin, FromOriginalModelMixin, UNet2DConditionLoadersMixin, PeftAdapterMixin
 ):
@@ -134,7 +135,8 @@ class UNet2DConditionModel(
             `"timestep"`, `"identity"`, `"projection"`, or `"simple_projection"`.
         addition_embed_type (`str`, *optional*, defaults to `None`):
             Configures an optional embedding which will be summed with the time embeddings. Choose from `None` or
-            "text". "text" will use the `TextTimeEmbedding` layer.
+            "text_time". "text_time" will use the `TextTimeEmbedding` layer.
+        # TODO: add "image_time" option
         addition_time_embed_dim: (`int`, *optional*, defaults to `None`):
             Dimension for the timestep embeddings.
         num_class_embeds (`int`, *optional*, defaults to `None`):
@@ -204,7 +206,7 @@ class UNet2DConditionModel(
         dual_cross_attention: bool = False,
         use_linear_projection: bool = False,
         class_embed_type: Optional[str] = None,
-        addition_embed_type: Optional[str] = None,
+        addition_embed_type: Optional[str] = None, # load: "addition_embed_type": "text_time", TODO: add 'image_time'
         addition_time_embed_dim: Optional[int] = None,
         num_class_embeds: Optional[int] = None,
         upcast_attention: bool = False,
@@ -223,7 +225,7 @@ class UNet2DConditionModel(
         class_embeddings_concat: bool = False,
         mid_block_only_cross_attention: Optional[bool] = None,
         cross_attention_norm: Optional[str] = None,
-        addition_embed_type_num_heads: int = 64,
+        addition_embed_type_num_heads: int = 64, # load: "addition_embed_type_num_heads": 64,
     ):
         super().__init__()
 
@@ -300,7 +302,7 @@ class UNet2DConditionModel(
             addition_embed_type_num_heads=addition_embed_type_num_heads,
             addition_time_embed_dim=addition_time_embed_dim,
             cross_attention_dim=cross_attention_dim,
-            encoder_hid_dim=encoder_hid_dim,
+            encoder_hid_dim=encoder_hid_dim, 
             flip_sin_to_cos=flip_sin_to_cos,
             freq_shift=freq_shift,
             projection_class_embeddings_input_dim=projection_class_embeddings_input_dim,
@@ -672,10 +674,10 @@ class UNet2DConditionModel(
         elif addition_embed_type == "text_time":
             self.add_time_proj = Timesteps(addition_time_embed_dim, flip_sin_to_cos, freq_shift)
             self.add_embedding = TimestepEmbedding(projection_class_embeddings_input_dim, time_embed_dim)
-        elif addition_embed_type == "image":
+        elif addition_embed_type == "image": # global-level
             # Kandinsky 2.2
             self.add_embedding = ImageTimeEmbedding(image_embed_dim=encoder_hid_dim, time_embed_dim=time_embed_dim)
-        elif addition_embed_type == "image_hint":
+        elif addition_embed_type == "image_hint": # local structure: depth, edge, sketch
             # Kandinsky 2.2 ControlNet
             self.add_embedding = ImageHintTimeEmbedding(image_embed_dim=encoder_hid_dim, time_embed_dim=time_embed_dim)
         elif addition_embed_type is not None:
@@ -1058,7 +1060,7 @@ class UNet2DConditionModel(
             sample (`torch.Tensor`):
                 The noisy input tensor with the following shape `(batch, channel, height, width)`.
             timestep (`torch.Tensor` or `float` or `int`): The number of timesteps to denoise an input.
-            encoder_hidden_states (`torch.Tensor`):
+            encoder_hidden_states (`torch.Tensor`): # text condition
                 The encoder hidden states with shape `(batch, sequence_length, feature_dim)`.
             class_labels (`torch.Tensor`, *optional*, defaults to `None`):
                 Optional class labels for conditioning. Their embeddings will be summed with the timestep embeddings.
